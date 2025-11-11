@@ -3,9 +3,6 @@ import os
 import base64
 import requests
 from datetime import datetime
-import csv
-import json
-from io import StringIO
 
 app = Flask(__name__)
 
@@ -46,101 +43,8 @@ def commit_to_github(filename: str, content: bytes, message: str = "Add submissi
         return False
 
 
-def get_all_submissions_from_github():
-    """Fetch all CSV files from the submissions directory in GitHub.
-    
-    Returns:
-        List of CSV content strings, or empty list if error.
-    """
-    token = os.getenv("GITHUB_TOKEN")
-    repo_full_name = os.getenv("REPO_FULL_NAME")
-    if not token or not repo_full_name:
-        print("GITHUB_TOKEN or REPO_FULL_NAME environment variable not set.")
-        return []
-    
-    submissions = []
-    url = f"https://api.github.com/repos/{repo_full_name}/contents/submissions"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-    }
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            files = response.json()
-            for file in files:
-                if file['name'].endswith('.csv') and file['name'] != 'sample_submission.csv':
-                    file_response = requests.get(file['download_url'])
-                    if file_response.status_code == 200:
-                        submissions.append(file_response.text)
-        return submissions
-    except Exception as e:
-        print(f"Error fetching submissions from GitHub: {e}")
-        return []
-
-
-def aggregate_submissions(csv_contents):
-    """Aggregate CSV submissions and calculate metrics.
-    
-    Args:
-        csv_contents: List of CSV content strings.
-    
-    Returns:
-        Dictionary with aggregated metrics.
-    """
-    totals = {"submissions": 0}
-    sums = {"sleep": 0.0, "rest": 0.0}
-    by_ship = {}
-    by_region = {}
-    
-    for csv_content in csv_contents:
-        try:
-            reader = csv.DictReader(StringIO(csv_content))
-            for row in reader:
-                if not row.get('ship_type') or not row.get('region'):
-                    continue
-                
-                totals["submissions"] += 1
-                
-                try:
-                    sleep = float(row.get('sleep_hours', 0) or 0)
-                except ValueError:
-                    sleep = 0.0
-                try:
-                    rest = float(row.get('rest_violations', 0) or 0)
-                except ValueError:
-                    rest = 0.0
-                
-                sums["sleep"] += sleep
-                sums["rest"] += rest
-                
-                ship = row['ship_type'].strip()
-                region = row['region'].strip()
-                by_ship[ship] = by_ship.get(ship, 0) + 1
-                by_region[region] = by_region.get(region, 0) + 1
-        except Exception as e:
-            print(f"Error processing CSV: {e}")
-            continue
-    
-    averages = {
-        "sleepHours": round(sums["sleep"] / totals["submissions"], 2) if totals["submissions"] else 0,
-        "restViolations": round(sums["rest"] / totals["submissions"], 2) if totals["submissions"] else 0,
-    }
-    
-    metrics = {
-        "totals": totals,
-        "averages": averages,
-        "byShip": by_ship,
-        "byRegion": by_region,
-        "updatedAt": datetime.utcnow().isoformat()
-    }
-    
-    return metrics
-
-
-def update_data_json():
-    """Fetch all submissions, aggregate them, and commit the updated data.json.
+def trigger_aggregation():
+    """Trigger the aggregation workflow by committing a timestamp file.
     
     Returns:
         True if successful, False otherwise.
@@ -152,23 +56,34 @@ def update_data_json():
         return False
     
     try:
-        submissions = get_all_submissions_from_github()
-        print(f"Found {len(submissions)} submission files")
+        # Commit a trigger file with current timestamp
+        timestamp = datetime.utcnow().isoformat()
+        trigger_content = f"Aggregation triggered at {timestamp}".encode('utf-8')
         
-        metrics = aggregate_submissions(submissions)
-        print(f"Aggregated metrics: {metrics['totals']['submissions']} submissions")
+        # Use workflow_dispatch API to trigger the workflow
+        url = f"https://api.github.com/repos/{repo_full_name}/actions/workflows/update-data.yml/dispatches"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        data = {
+            "ref": "main",
+        }
         
-        data_json_content = json.dumps(metrics, indent=2).encode('utf-8')
-        success = commit_to_github('data/data.json', data_json_content, 'Update aggregated metrics')
-        
-        if success:
-            print("Successfully updated data.json")
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 204:
+            print("Workflow dispatch triggered successfully")
             return True
         else:
-            print("Failed to commit data.json")
-            return False
+            print(f"Failed to trigger workflow: {response.status_code} {response.text}")
+            # Try alternative: commit a trigger file
+            return commit_to_github(
+                '.github/trigger.txt',
+                trigger_content,
+                f'Trigger aggregation at {timestamp}'
+            )
     except Exception as e:
-        print(f"Error updating data.json: {e}")
+        print(f"Error triggering aggregation: {e}")
         return False
 
 
@@ -193,7 +108,8 @@ def upload_file():
         commit_message = f"Add submission {safe_filename} on {timestamp}"
         success = commit_to_github(target_path, content, commit_message)
         if success:
-            update_data_json()
+            # Trigger the aggregation workflow
+            trigger_aggregation()
             return jsonify({'status': 'success'}), 200
         else:
             return jsonify({'error': 'Failed to commit file to GitHub.'}), 500
