@@ -5,10 +5,89 @@ import requests
 import json
 import csv
 from io import StringIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
+import hashlib
 
 app = Flask(__name__)
+
+# In-memory rate limiting store (IP -> last submission timestamp)
+# Note: This resets when the serverless function restarts, but that's acceptable
+rate_limit_store = {}
+
+def check_rate_limit(ip_address):
+    """Check if an IP address has exceeded the rate limit.
+    
+    Args:
+        ip_address: The IP address to check
+    
+    Returns:
+        Tuple (allowed: bool, wait_time: int) - wait_time in seconds if not allowed
+    """
+    now = datetime.utcnow()
+    rate_limit_hours = 24  # 1 submission per 24 hours per IP
+    
+    if ip_address in rate_limit_store:
+        last_submission = rate_limit_store[ip_address]
+        time_diff = now - last_submission
+        required_wait = timedelta(hours=rate_limit_hours)
+        
+        if time_diff < required_wait:
+            wait_seconds = int((required_wait - time_diff).total_seconds())
+            return False, wait_seconds
+    
+    # Update the rate limit store
+    rate_limit_store[ip_address] = now
+    return True, 0
+
+
+def validate_submission_data(data):
+    """Validate submission data for reasonable values.
+    
+    Args:
+        data: Dictionary with submission fields
+    
+    Returns:
+        Tuple (valid: bool, error_message: str)
+    """
+    try:
+        # Extract and validate sleep hours
+        sleep_hours = float(data.get('sleep_hours', -1))
+        if sleep_hours < 0 or sleep_hours > 24:
+            return False, "Sleep hours must be between 0 and 24"
+        
+        # Extract and validate rest violations
+        rest_violations = float(data.get('rest_violations', -1))
+        if rest_violations < 0 or rest_violations > 50:
+            return False, "Rest violations must be between 0 and 50"
+        
+        # Validate ship type
+        valid_ship_types = ['Tanker', 'Bulk', 'Container', 'Gas', 'Other']
+        ship_type = data.get('ship_type', '')
+        if ship_type not in valid_ship_types:
+            return False, f"Invalid ship type. Must be one of: {', '.join(valid_ship_types)}"
+        
+        # Validate region
+        valid_regions = ['Global', 'Europe', 'Middle East', 'Asia', 'Africa', 'Americas']
+        region = data.get('region', '')
+        if region not in valid_regions:
+            return False, f"Invalid region. Must be one of: {', '.join(valid_regions)}"
+        
+        # Validate called during rest
+        valid_called = ['Yes', 'No']
+        called = data.get('called_during_rest', '')
+        if called not in valid_called:
+            return False, "Called during rest must be 'Yes' or 'No'"
+        
+        # Validate port intensity
+        valid_intensity = ['Low', 'Medium', 'High']
+        intensity = data.get('port_intensity', '')
+        if intensity not in valid_intensity:
+            return False, f"Invalid port intensity. Must be one of: {', '.join(valid_intensity)}"
+        
+        return True, ""
+    except (ValueError, TypeError) as e:
+        return False, f"Invalid data format: {str(e)}"
 
 
 def get_csv_files_from_github():
@@ -192,25 +271,75 @@ def upload_file():
     Expects a multipart/form-data POST request with a file field named
     "submission" containing a CSV file. The file will be stored in the
     `submissions/` directory of the configured repository.
+    
+    Security features:
+    - Rate limiting: 1 submission per IP per 24 hours
+    - Data validation: Checks for reasonable values
+    - Honeypot detection: Rejects submissions with honeypot field filled
     """
+    # Get client IP address (handle proxies)
+    if request.headers.get('X-Forwarded-For'):
+        ip_address = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    else:
+        ip_address = request.remote_addr
+    
+    # Check rate limit
+    allowed, wait_time = check_rate_limit(ip_address)
+    if not allowed:
+        hours_remaining = wait_time // 3600
+        minutes_remaining = (wait_time % 3600) // 60
+        return jsonify({
+            'error': f'Rate limit exceeded. Please wait {hours_remaining}h {minutes_remaining}m before submitting again.'
+        }), 429
+    
+    # Check for honeypot field (bot detection)
+    honeypot_value = request.form.get('website', '')
+    if honeypot_value:
+        # This is likely a bot - honeypot field should be empty
+        print(f"Honeypot triggered from IP: {ip_address}")
+        return jsonify({'error': 'Invalid submission.'}), 400
+    
     if 'submission' not in request.files:
         return jsonify({'error': 'No submission file provided.'}), 400
+    
     file = request.files['submission']
     if file.filename == '':
         return jsonify({'error': 'Empty filename.'}), 400
+    
     try:
         content = file.read()
+        
+        # Parse and validate the CSV data
+        try:
+            csv_content = content.decode('utf-8')
+            reader = csv.DictReader(StringIO(csv_content))
+            rows = list(reader)
+            
+            if not rows:
+                return jsonify({'error': 'Empty CSV file.'}), 400
+            
+            # Validate the first (and should be only) row
+            valid, error_msg = validate_submission_data(rows[0])
+            if not valid:
+                return jsonify({'error': error_msg}), 400
+                
+        except Exception as e:
+            return jsonify({'error': f'Invalid CSV format: {str(e)}'}), 400
+        
+        # Proceed with committing the file
         timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
         safe_filename = file.filename.replace("..", "_")
         target_path = f"submissions/{timestamp}_{safe_filename}"
         commit_message = f"Add submission {safe_filename} on {timestamp}"
         success = commit_to_github(target_path, content, commit_message)
+        
         if success:
             # Update the aggregated data
             update_aggregated_data()
             return jsonify({'status': 'success'}), 200
         else:
             return jsonify({'error': 'Failed to commit file to GitHub.'}), 500
+            
     except Exception as e:
         print(f"Exception while processing upload: {e}")
         return jsonify({'error': 'Internal server error.'}), 500
