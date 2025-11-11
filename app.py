@@ -2,13 +2,118 @@ from flask import Flask, request, jsonify
 import os
 import base64
 import requests
+import json
+import csv
+from io import StringIO
 from datetime import datetime
+from collections import defaultdict
 
 app = Flask(__name__)
 
 
+def get_csv_files_from_github():
+    """Fetch all CSV files from the submissions directory on GitHub.
+    
+    Returns:
+        List of tuples: (filename, content)
+    """
+    token = os.getenv("GITHUB_TOKEN")
+    repo_full_name = os.getenv("REPO_FULL_NAME")
+    if not token or not repo_full_name:
+        print("GITHUB_TOKEN or REPO_FULL_NAME environment variable not set.")
+        return []
+    
+    try:
+        url = f"https://api.github.com/repos/{repo_full_name}/contents/submissions"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            print(f"Failed to fetch submissions directory: {response.status_code}")
+            return []
+        
+        files = response.json()
+        csv_files = []
+        
+        for file_info in files:
+            if file_info['name'].endswith('.csv'):
+                # Fetch the file content
+                file_response = requests.get(file_info['download_url'])
+                if file_response.status_code == 200:
+                    csv_files.append((file_info['name'], file_response.text))
+        
+        return csv_files
+    except Exception as e:
+        print(f"Error fetching CSV files: {e}")
+        return []
+
+
+def aggregate_submissions(csv_files):
+    """Aggregate CSV submissions and calculate metrics.
+    
+    Args:
+        csv_files: List of tuples (filename, content)
+    
+    Returns:
+        Dictionary with aggregated data
+    """
+    submissions = []
+    
+    for filename, content in csv_files:
+        try:
+            reader = csv.DictReader(StringIO(content))
+            for row in reader:
+                submissions.append(row)
+        except Exception as e:
+            print(f"Error parsing {filename}: {e}")
+            continue
+    
+    if not submissions:
+        return {
+            "totals": {"submissions": 0},
+            "averages": {"sleepHours": 0, "restViolations": 0},
+            "byShip": {},
+            "byRegion": {},
+            "updatedAt": datetime.utcnow().isoformat() + "+00:00"
+        }
+    
+    # Calculate metrics
+    total_submissions = len(submissions)
+    total_sleep = sum(float(s.get('sleepHours', 0)) for s in submissions)
+    total_violations = sum(float(s.get('restViolations', 0)) for s in submissions)
+    
+    avg_sleep = total_sleep / total_submissions if total_submissions > 0 else 0
+    avg_violations = total_violations / total_submissions if total_submissions > 0 else 0
+    
+    # Group by ship type
+    by_ship = defaultdict(int)
+    for s in submissions:
+        ship_type = s.get('shipType', 'Unknown')
+        by_ship[ship_type] += 1
+    
+    # Group by region
+    by_region = defaultdict(int)
+    for s in submissions:
+        region = s.get('tradingRegion', 'Unknown')
+        by_region[region] += 1
+    
+    return {
+        "totals": {"submissions": total_submissions},
+        "averages": {
+            "sleepHours": round(avg_sleep, 2),
+            "restViolations": round(avg_violations, 2)
+        },
+        "byShip": dict(by_ship),
+        "byRegion": dict(by_region),
+        "updatedAt": datetime.utcnow().isoformat() + "+00:00"
+    }
+
+
 def commit_to_github(filename: str, content: bytes, message: str = "Add submission") -> bool:
-    """Commit a file to the configured GitHub repository using the contents provided.
+    """Commit a file to the configured GitHub repository.
 
     Args:
         filename: The filename (path relative to the repo root) to commit.
@@ -43,47 +148,28 @@ def commit_to_github(filename: str, content: bytes, message: str = "Add submissi
         return False
 
 
-def trigger_aggregation():
-    """Trigger the aggregation workflow by committing a timestamp file.
-    
-    Returns:
-        True if successful, False otherwise.
-    """
-    token = os.getenv("GITHUB_TOKEN")
-    repo_full_name = os.getenv("REPO_FULL_NAME")
-    if not token or not repo_full_name:
-        print("GITHUB_TOKEN or REPO_FULL_NAME environment variable not set.")
-        return False
-    
+def update_aggregated_data():
+    """Fetch all CSV files, aggregate them, and commit the updated data.json."""
     try:
-        # Commit a trigger file with current timestamp
-        timestamp = datetime.utcnow().isoformat()
-        trigger_content = f"Aggregation triggered at {timestamp}".encode('utf-8')
+        # Fetch all CSV files from GitHub
+        csv_files = get_csv_files_from_github()
+        print(f"Found {len(csv_files)} CSV files")
         
-        # Use workflow_dispatch API to trigger the workflow
-        url = f"https://api.github.com/repos/{repo_full_name}/actions/workflows/update-data.yml/dispatches"
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github+json",
-        }
-        data = {
-            "ref": "main",
-        }
+        # Aggregate the data
+        aggregated_data = aggregate_submissions(csv_files)
+        print(f"Aggregated {aggregated_data['totals']['submissions']} submissions")
         
-        response = requests.post(url, json=data, headers=headers)
-        if response.status_code == 204:
-            print("Workflow dispatch triggered successfully")
-            return True
-        else:
-            print(f"Failed to trigger workflow: {response.status_code} {response.text}")
-            # Try alternative: commit a trigger file
-            return commit_to_github(
-                '.github/trigger.txt',
-                trigger_content,
-                f'Trigger aggregation at {timestamp}'
-            )
+        # Commit the updated data.json
+        data_json = json.dumps(aggregated_data, indent=2)
+        success = commit_to_github(
+            'data/data.json',
+            data_json.encode('utf-8'),
+            f"Update aggregated data - {aggregated_data['totals']['submissions']} submissions"
+        )
+        
+        return success
     except Exception as e:
-        print(f"Error triggering aggregation: {e}")
+        print(f"Error updating aggregated data: {e}")
         return False
 
 
@@ -108,8 +194,8 @@ def upload_file():
         commit_message = f"Add submission {safe_filename} on {timestamp}"
         success = commit_to_github(target_path, content, commit_message)
         if success:
-            # Trigger the aggregation workflow
-            trigger_aggregation()
+            # Update the aggregated data
+            update_aggregated_data()
             return jsonify({'status': 'success'}), 200
         else:
             return jsonify({'error': 'Failed to commit file to GitHub.'}), 500
@@ -118,9 +204,5 @@ def upload_file():
         return jsonify({'error': 'Internal server error.'}), 500
 
 # For Vercel: expose the Flask app as a WSGI callable
-# Vercel looks for `app` or `application` in the module for WSGI apps.
-# Here we expose it as `app` so Vercel can serve it.
-
-# The following section allows the app to run locally with `python app.py`
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
