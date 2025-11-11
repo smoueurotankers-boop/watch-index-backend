@@ -135,11 +135,23 @@ def commit_to_github(filename: str, content: bytes, message: str = "Add submissi
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
     }
+    
+    # Check if file exists and get its SHA
+    sha = None
+    get_response = requests.get(url, headers=headers)
+    if get_response.status_code == 200:
+        sha = get_response.json().get('sha')
+    
     data = {
         "message": message,
         "content": encoded_content,
         "branch": "main",
     }
+    
+    # Include SHA if file exists (for updates)
+    if sha:
+        data["sha"] = sha
+    
     response = requests.put(url, json=data, headers=headers)
     if response.status_code in (201, 200):
         return True
