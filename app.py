@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
 import base64
 import requests
@@ -10,6 +11,7 @@ from collections import defaultdict
 import hashlib
 
 app = Flask(__name__)
+CORS(app, origins=['https://thewatchindex.org'])
 
 # In-memory rate limiting store (IP -> last submission timestamp)
 # Note: This resets when the serverless function restarts, but that's acceptable
