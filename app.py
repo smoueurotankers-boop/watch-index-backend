@@ -43,6 +43,39 @@ def commit_to_github(filename: str, content: bytes, message: str = "Add submissi
         return False
 
 
+def trigger_workflow():
+    """Trigger the GitHub Actions workflow to aggregate data.
+    
+    Returns:
+        True if the workflow was triggered successfully, False otherwise.
+    """
+    token = os.getenv("GITHUB_TOKEN")
+    repo_full_name = os.getenv("REPO_FULL_NAME")
+    if not token or not repo_full_name:
+        print("GITHUB_TOKEN or REPO_FULL_NAME environment variable not set.")
+        return False
+
+    url = f"https://api.github.com/repos/{repo_full_name}/actions/workflows/update-data.yml/dispatches"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    data = {
+        "ref": "main",
+    }
+    try:
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 204:
+            print("Workflow triggered successfully")
+            return True
+        else:
+            print(f"Failed to trigger workflow: {response.status_code} {response.text}")
+            return False
+    except Exception as e:
+        print(f"Error triggering workflow: {e}")
+        return False
+
+
 @app.route('/upload', methods=['POST'])
 def upload_file():
     """Endpoint to handle file submissions and commit them to GitHub.
@@ -64,6 +97,8 @@ def upload_file():
         commit_message = f"Add submission {safe_filename} on {timestamp}"
         success = commit_to_github(target_path, content, commit_message)
         if success:
+            # Trigger the workflow to aggregate data
+            trigger_workflow()
             return jsonify({'status': 'success'}), 200
         else:
             return jsonify({'error': 'Failed to commit file to GitHub.'}), 500
