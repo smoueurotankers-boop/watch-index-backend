@@ -82,8 +82,8 @@ def aggregate_submissions(csv_files):
     
     # Calculate metrics
     total_submissions = len(submissions)
-    total_sleep = sum(float(s.get('sleepHours', 0)) for s in submissions)
-    total_violations = sum(float(s.get('restViolations', 0)) for s in submissions)
+    total_sleep = sum(float(s.get('sleep_hours', 0)) for s in submissions)
+    total_violations = sum(float(s.get('rest_violations', 0)) for s in submissions)
     
     avg_sleep = total_sleep / total_submissions if total_submissions > 0 else 0
     avg_violations = total_violations / total_submissions if total_submissions > 0 else 0
@@ -91,13 +91,13 @@ def aggregate_submissions(csv_files):
     # Group by ship type
     by_ship = defaultdict(int)
     for s in submissions:
-        ship_type = s.get('shipType', 'Unknown')
+        ship_type = s.get('ship_type', 'Unknown')
         by_ship[ship_type] += 1
     
     # Group by region
     by_region = defaultdict(int)
     for s in submissions:
-        region = s.get('tradingRegion', 'Unknown')
+        region = s.get('region', 'Unknown')
         by_region[region] += 1
     
     return {
